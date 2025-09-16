@@ -1,0 +1,247 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: POC - Carpeta Ciudadana - Folder opening flow (SNS->SQS->Lambdas->S3/Dynamo) with X-Ray
+
+Parameters:
+  TableName:
+    Type: String
+    Default: TransactionalStorage
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    Tracing: Active
+    MemorySize: 256
+    Environment:
+      Variables:
+        TRANSACTION_TABLE: !Ref TransactionTable
+        OBJECT_BUCKET: !Ref OperatorBucket
+        IDENTITY_RESPONSE_QUEUE_URL: !Ref IdentityResponseQueue
+        REGISTRY_RESPONSE_QUEUE_URL: !Ref RegistryResponseQueue
+        FOLDER_CREATED_TOPIC_ARN: !Ref FolderCreatedTopic
+
+Resources:
+
+  OperatorBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub operator-object-storage-${AWS::AccountId}-${AWS::Region}
+
+  TransactionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  FolderOpeningRequestsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: folder-opening-requests
+
+  FolderCreatedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: folder-created
+
+  FolderRequestsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: folder-requests-queue
+
+  IdentityResponseQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: identity-response-queue
+
+  RegistryResponseQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: registry-response-queue
+
+  FolderOpeningSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FolderOpeningRequestsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt FolderRequestsQueue.Arn
+      RawMessageDelivery: true
+
+  FolderRequestsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FolderRequestsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt FolderRequestsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref FolderOpeningRequestsTopic
+
+  ValidateIdentityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: validate-identity
+      CodeUri: src/validate_identity/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+        - S3WritePolicy:
+            BucketName: !Ref OperatorBucket
+        - Statement:
+            Effect: Allow
+            Action: 'lambda:InvokeFunction'
+            Resource: !GetAtt RegistraduriaFunction.Arn
+      Environment:
+        Variables:
+          REGISTRADURIA_FUNCTION_NAME: !Ref RegistraduriaFunction
+      Events:
+        FolderRequestsSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FolderRequestsQueue.Arn
+            BatchSize: 5
+
+  RegistraduriaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: registraduria-mock
+      CodeUri: src/registraduria/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+        - Statement:
+            Effect: Allow
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt IdentityResponseQueue.Arn
+
+  NotifyRegistryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: notify-registry
+      CodeUri: src/notify_registry/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+        - Statement:
+            Effect: Allow
+            Action: 'lambda:InvokeFunction'
+            Resource: !GetAtt MinTICFunction.Arn
+      Environment:
+        Variables:
+          MINTIC_FUNCTION_NAME: !Ref MinTICFunction
+      Events:
+        IdentityResponseSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IdentityResponseQueue.Arn
+            BatchSize: 5
+
+  MinTICFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mintic-mock
+      CodeUri: src/min_tic/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+        - Statement:
+            Effect: Allow
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt RegistryResponseQueue.Arn
+
+  CreateFolderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: create-folder
+      CodeUri: src/create_folder/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+        - Statement:
+            Effect: Allow
+            Action: 'sns:Publish'
+            Resource: !Ref FolderCreatedTopic
+      Environment:
+        Variables:
+          FOLDER_CREATED_TOPIC_ARN: !Ref FolderCreatedTopic
+      Events:
+        RegistryResponseSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RegistryResponseQueue.Arn
+            BatchSize: 5
+
+  GenerateUniqueEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: generate-unique-email
+      CodeUri: src/generate_unique_email/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+      Events:
+        FolderCreatedSNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref FolderCreatedTopic
+
+  LoadSignedIdentityDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: load-signed-identity-document
+      CodeUri: src/load_signed_identity_document/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionTable
+      Events:
+        FolderCreatedSNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref FolderCreatedTopic
+
+Outputs:
+  OpeningRequestsTopicArn:
+    Value: !Ref FolderOpeningRequestsTopic
+  FolderRequestsQueueUrl:
+    Value: !Ref FolderRequestsQueue
+  IdentityResponseQueueUrl:
+    Value: !Ref IdentityResponseQueue
+  RegistryResponseQueueUrl:
+    Value: !Ref RegistryResponseQueue
+  FolderCreatedTopicArn:
+    Value: !Ref FolderCreatedTopic
+  BucketName:
+    Value: !Ref OperatorBucket
+  TableName:
+    Value: !Ref TransactionTable
