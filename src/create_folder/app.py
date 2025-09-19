@@ -29,11 +29,6 @@ def ensure_txn_id(payload: dict) -> str:
         payload["transactionId"] = tx
     return tx
 
-def get_citizen_key(ciudadano: dict) -> str:
-    if not ciudadano:
-        return "UNKNOWN"
-    return f"{ciudadano.get('tipoId','?')}-{ciudadano.get('numeroId','?')}"
-
 def dyn_put(tx, step, data):
     if not table:
         return
@@ -46,14 +41,22 @@ def dyn_put(tx, step, data):
     table.put_item(Item=item)
 
 def handler(event, context):
-    # Trigger: SQS registry-response-queue
+    # Trigger: SQS registry-response-queue (ResultadoRegistro)
     for r in event.get("Records", []):
-        payload = json.loads(r.get("body"))
-        tx = ensure_txn_id(payload)
-        dyn_put(tx, "CreateFolder:CREATED", payload)
-        # Notify downstream
-        msg = {"transactionId": tx, "evento": "CarpetaCreada", "emitidoEn": now_iso()}
+        msg = json.loads(r.get("body"))
+        if msg.get("resourceType") != "ResultadoRegistro":
+            msg["resourceType"] = "ResultadoRegistro"
+
+        tx = ensure_txn_id(msg)
+        dyn_put(tx, "CreateFolder:CREATED", msg)
+
+        notificacion = {
+            "resourceType": "NotificacionCarpetaCreada",
+            "transactionId": tx,
+            "emitidoEn": now_iso()
+        }
+
         xray_recorder.begin_subsegment("publish_folder_created")
-        sns.publish(TopicArn=FOLDER_CREATED_TOPIC_ARN, Message=json.dumps(msg))
+        sns.publish(TopicArn=FOLDER_CREATED_TOPIC_ARN, Message=json.dumps(notificacion))
         xray_recorder.end_subsegment()
     return {"ok": True}

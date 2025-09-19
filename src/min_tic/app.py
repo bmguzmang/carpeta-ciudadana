@@ -29,11 +29,6 @@ def ensure_txn_id(payload: dict) -> str:
         payload["transactionId"] = tx
     return tx
 
-def get_citizen_key(ciudadano: dict) -> str:
-    if not ciudadano:
-        return "UNKNOWN"
-    return f"{ciudadano.get('tipoId','?')}-{ciudadano.get('numeroId','?')}"
-
 def dyn_put(tx, step, data):
     if not table:
         return
@@ -47,12 +42,21 @@ def dyn_put(tx, step, data):
 
 import time
 def handler(event, context):
-    # Mock of MinTIC centralizer
-    tx = ensure_txn_id(event if isinstance(event, dict) else {})
-    time.sleep(0.2)
-    response = {"transactionId": tx, "estadoRegistro": "Aceptado", "procesadoEn": now_iso()}
+    # Input: ResultadoVerificacion (canonical)
+    msg = event if isinstance(event, dict) else {}
+    tx = ensure_txn_id(msg)
+
+    time.sleep(0.1)
+    resultado_registro = {
+        "resourceType": "ResultadoRegistro",
+        "transactionId": tx,
+        "estadoRegistro": "Aceptado",
+        "procesadoEn": now_iso()
+    }
+
     xray_recorder.begin_subsegment("send_to_registry_response_queue")
-    sqs.send_message(QueueUrl=REGISTRY_RESPONSE_QUEUE_URL, MessageBody=json.dumps(response))
+    sqs.send_message(QueueUrl=REGISTRY_RESPONSE_QUEUE_URL, MessageBody=json.dumps(resultado_registro))
     xray_recorder.end_subsegment()
-    dyn_put(tx, "MinTIC:PROCESSED", response)
+
+    dyn_put(tx, "ResultadoRegistro:SENT", resultado_registro)
     return {"ok": True}

@@ -29,11 +29,6 @@ def ensure_txn_id(payload: dict) -> str:
         payload["transactionId"] = tx
     return tx
 
-def get_citizen_key(ciudadano: dict) -> str:
-    if not ciudadano:
-        return "UNKNOWN"
-    return f"{ciudadano.get('tipoId','?')}-{ciudadano.get('numeroId','?')}"
-
 def dyn_put(tx, step, data):
     if not table:
         return
@@ -46,18 +41,22 @@ def dyn_put(tx, step, data):
     table.put_item(Item=item)
 
 def handler(event, context):
-    # Trigger: SQS identity-response-queue
+    # Trigger: SQS identity-response-queue (ResultadoVerificacion)
     for r in event.get("Records", []):
-        payload = json.loads(r.get("body"))
-        tx = ensure_txn_id(payload)
-        dyn_put(tx, "NotifyRegistry:RECEIVED", payload)
+        msg = json.loads(r.get("body"))
+        if msg.get("resourceType") != "ResultadoVerificacion":
+            # normalize older messages
+            msg["resourceType"] = "ResultadoVerificacion"
 
-        # Invoke MinTIC mock with minimal info
+        tx = ensure_txn_id(msg)
+        dyn_put(tx, "ResultadoVerificacion:RECEIVED", msg)
+
+        # Forward to MinTIC preserving canonical resourceType
         xray_recorder.begin_subsegment("invoke_mintic_mock")
         lambda_client.invoke(
             FunctionName=MINTIC_FUNCTION_NAME,
             InvocationType="Event",
-            Payload=json.dumps({"transactionId": tx, "resultadoVerificacion": payload}).encode("utf-8"),
+            Payload=json.dumps(msg).encode("utf-8"),
         )
         xray_recorder.end_subsegment()
     return {"ok": True}

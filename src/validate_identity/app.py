@@ -29,11 +29,6 @@ def ensure_txn_id(payload: dict) -> str:
         payload["transactionId"] = tx
     return tx
 
-def get_citizen_key(ciudadano: dict) -> str:
-    if not ciudadano:
-        return "UNKNOWN"
-    return f"{ciudadano.get('tipoId','?')}-{ciudadano.get('numeroId','?')}"
-
 def dyn_put(tx, step, data):
     if not table:
         return
@@ -45,40 +40,67 @@ def dyn_put(tx, step, data):
     }
     table.put_item(Item=item)
 
+def build_xml_solicitud_verificacion(tx: str, ciudadano: dict, motivo: str) -> str:
+    def esc(v):
+        if v is None: return ""
+        return str(v).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<SolicitudVerificacion>
+  <TransactionId>{esc(tx)}</TransactionId>
+  <Motivo>{esc(motivo)}</Motivo>
+  <Ciudadano>
+    <TipoId>{esc(ciudadano.get('tipoId'))}</TipoId>
+    <NumeroId>{esc(ciudadano.get('numeroId'))}</NumeroId>
+    <Nombres>{esc(ciudadano.get('nombres'))}</Nombres>
+    <Apellidos>{esc(ciudadano.get('apellidos'))}</Apellidos>
+    <FechaNacimiento>{esc(ciudadano.get('fechaNacimiento'))}</FechaNacimiento>
+  </Ciudadano>
+</SolicitudVerificacion>
+"""
+
 def handler(event, context):
-    # Trigger: SQS folder-requests-queue (messages from SNS with RawMessageDelivery=true)
-    records = event.get("Records", [])
-    for r in records:
-        body = r.get("body")
+    # Trigger: SQS (SolicitudApertura via SNS)
+    for rec in event.get("Records", []):
+        body = rec.get("body")
         try:
-            payload = json.loads(body)
+            msg = json.loads(body)
         except Exception:
-            # If SNS wrapping is present
-            payload = json.loads(json.loads(body)["Message"])
+            msg = json.loads(json.loads(body)["Message"])
 
-        tx = ensure_txn_id(payload)
-        ciudadano = payload.get("ciudadano", {})
-        citizen_key = get_citizen_key(ciudadano)
+        # Expect canonical: SolicitudApertura
+        if msg.get("resourceType") != "SolicitudApertura":
+            # make it canonical on the fly (backward compatibility)
+            msg["resourceType"] = "SolicitudApertura"
 
-        # S3 mock object (operator object storage)
-        xray_recorder.begin_subsegment("write_mock_s3")
+        tx = ensure_txn_id(msg)
+        ciudadano = msg.get("ciudadano", {})
+
+        # Persist the received canonical request
+        dyn_put(tx, "SolicitudApertura:RECEIVED", msg)
+
+        # Optional: S3 breadcrumb
+        xray_recorder.begin_subsegment("write_mock_s3_breadcrumb")
         s3.put_object(
             Bucket=BUCKET_NAME,
             Key=f"validations/{tx}.txt",
-            Body=f"validation started for {citizen_key} at {now_iso()}".encode("utf-8"),
+            Body=f"SolicitudApertura received at {now_iso()}".encode("utf-8"),
         )
         xray_recorder.end_subsegment()
 
-        # Dynamo record
-        dyn_put(tx, "ValidateIdentity:RECEIVED", {"ciudadano": ciudadano})
+        # Build XML version of SolicitudVerificacion (canonical name preserved in envelope meta)
+        xml_payload = build_xml_solicitud_verificacion(tx, ciudadano, "Registro")
+        envelope = {
+            "contentType": "application/xml",
+            "resourceType": "SolicitudVerificacion",
+            "payload": xml_payload
+        }
 
-        # Invoke Registraduría mock with our canonical 'SolicitudVerificacion'
-        solicitud = {"transactionId": tx, "ciudadano": ciudadano, "motivo": "Registro"}
-        xray_recorder.begin_subsegment("invoke_registraduria_mock")
+        xray_recorder.begin_subsegment("invoke_registraduria_mock_xml")
         lambda_client.invoke(
             FunctionName=REGISTRADURIA_FUNCTION_NAME,
             InvocationType="Event",
-            Payload=json.dumps(solicitud).encode("utf-8"),
+            Payload=json.dumps(envelope).encode("utf-8"),
         )
         xray_recorder.end_subsegment()
-    return {"ok": True, "processed": len(records)}
+
+    return {"ok": True}

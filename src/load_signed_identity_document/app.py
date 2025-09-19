@@ -29,11 +29,6 @@ def ensure_txn_id(payload: dict) -> str:
         payload["transactionId"] = tx
     return tx
 
-def get_citizen_key(ciudadano: dict) -> str:
-    if not ciudadano:
-        return "UNKNOWN"
-    return f"{ciudadano.get('tipoId','?')}-{ciudadano.get('numeroId','?')}"
-
 def dyn_put(tx, step, data):
     if not table:
         return
@@ -46,9 +41,12 @@ def dyn_put(tx, step, data):
     table.put_item(Item=item)
 
 def handler(event, context):
-    # Trigger: SNS folder-created
+    # Trigger: SNS folder-created (NotificacionCarpetaCreada)
     for r in event.get("Records", []):
         m = json.loads(r["Sns"]["Message"])
+        if m.get("resourceType") != "NotificacionCarpetaCreada":
+            m["resourceType"] = "NotificacionCarpetaCreada"
         tx = ensure_txn_id(m)
-        dyn_put(tx, "LoadSignedIdentityDocument:DONE", {"docType": "CedulaFirmada"})
+        salida = {"resourceType":"DocumentoIdentidadCargado","transactionId":tx,"docType":"CedulaFirmada","cargadoEn":now_iso()}
+        dyn_put(tx, "DocumentoIdentidadCargado:DONE", salida)
     return {"ok": True}
